@@ -1,0 +1,351 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using HighSpeedImageViewer.Services;
+using SkiaSharp;
+
+namespace HighSpeedImageViewer.Controls;
+
+public class SkiaImageViewer : FrameworkElement
+{
+    private SKBitmap? _bitmap;
+    private float _zoom = 1f;
+    private float _targetZoom = 1f;
+    private float _offsetX, _offsetY;
+    private float _targetOffsetX, _targetOffsetY;
+    private bool _isDragging;
+    private Point _dragStart;
+    private float _dragStartOffsetX, _dragStartOffsetY;
+    private float _fitScale = 1f;
+    private CancellationTokenSource? _loadCts;
+    private WriteableBitmap? _wbmp;
+    private bool _dirty = true;
+    private bool _isPanning;
+
+    private float _animOpacity = 1f;
+    private DateTime _animStart;
+    private float _animFromZoom, _animFromOffX, _animFromOffY;
+    private bool _animating;
+    private const float AnimDuration = 0.18f;
+
+    public ImageLoader ImageLoader { get; } = new();
+
+    public event Action<float>? ZoomChanged;
+    public event Action<string>? StatusChanged;
+
+    public SkiaImageViewer()
+    {
+        Loaded += (_, _) =>
+        {
+            var parent = VisualTreeHelper.GetParent(this) as FrameworkElement;
+            if (parent != null)
+                parent.SizeChanged += (_, e) =>
+                {
+                    InvalidateMeasure();
+                    if (!_isDragging && !_animating && _bitmap != null)
+                        FitToScreen();
+                };
+        };
+    }
+
+    public float Zoom
+    {
+        get => _zoom;
+        set
+        {
+            _targetZoom = Math.Clamp(value, 0.05f, 20f);
+            StartZoomAnim();
+        }
+    }
+
+    private void StartZoomAnim()
+    {
+        _animFromZoom = _zoom;
+        _animFromOffX = _offsetX;
+        _animFromOffY = _offsetY;
+        _animStart = DateTime.UtcNow;
+        _animating = true;
+        _dirty = true;
+        CompositionTarget.Rendering += OnRendering;
+    }
+
+    private void OnRendering(object? sender, EventArgs e)
+    {
+        var elapsed = (float)(DateTime.UtcNow - _animStart).TotalSeconds;
+        var t = Math.Clamp(elapsed / AnimDuration, 0f, 1f);
+        t = t * t * (3f - 2f * t);
+
+        _zoom = _animFromZoom + (_targetZoom - _animFromZoom) * t;
+        _offsetX = _animFromOffX + (_targetOffsetX - _animFromOffX) * t;
+        _offsetY = _animFromOffY + (_targetOffsetY - _animFromOffY) * t;
+
+        if (t >= 1f)
+        {
+            _zoom = _targetZoom;
+            _offsetX = _targetOffsetX;
+            _offsetY = _targetOffsetY;
+            _animating = false;
+            CompositionTarget.Rendering -= OnRendering;
+        }
+
+        _dirty = true;
+        InvalidateVisual();
+    }
+
+    public void LoadImage(string path)
+    {
+        _loadCts?.Cancel();
+        _loadCts = new CancellationTokenSource();
+        var ct = _loadCts.Token;
+
+        StatusChanged?.Invoke("加载中...");
+
+        Task.Run(async () =>
+        {
+            var result = await ImageLoader.LoadAsync(path, ct);
+            if (ct.IsCancellationRequested) return;
+
+            await Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                if (ct.IsCancellationRequested) return;
+
+                _bitmap?.Dispose();
+                _wbmp = null;
+                _bitmap = null;
+
+                if (result.IsSuccess && result.Bitmap != null)
+                {
+                    _bitmap = result.Bitmap;
+                    _dirty = true;
+                    _animOpacity = 0f;
+                    FitToScreen();
+
+                    var fadeStart = DateTime.UtcNow;
+                    CompositionTarget.Rendering += FadeIn;
+                    void FadeIn(object? s, EventArgs e)
+                    {
+                        var ft = (float)(DateTime.UtcNow - fadeStart).TotalSeconds / 0.2f;
+                        _animOpacity = Math.Clamp(ft, 0f, 1f);
+                        _dirty = true;
+                        InvalidateVisual();
+                        if (_animOpacity >= 1f)
+                        {
+                            CompositionTarget.Rendering -= FadeIn;
+                            _animOpacity = 1f;
+                        }
+                    }
+
+                    StatusChanged?.Invoke($"{result.Bitmap.Width}x{result.Bitmap.Height}");
+                }
+                else
+                {
+                    StatusChanged?.Invoke($"加载失败: {result.ErrorMessage}");
+                }
+                InvalidateVisual();
+            });
+        }, ct);
+    }
+
+    public void FitToScreen()
+    {
+        if (_bitmap == null)
+        {
+            StatusChanged?.Invoke("无可显示图片");
+            return;
+        }
+
+        var w = (float)Math.Max(1, ActualWidth);
+        var h = (float)Math.Max(1, ActualHeight);
+        if (w <= 1 || h <= 1)
+        {
+            Dispatcher.BeginInvoke(() => FitToScreen());
+            return;
+        }
+
+        _fitScale = Math.Min(w / _bitmap.Width, h / _bitmap.Height);
+        _targetZoom = _fitScale;
+        _targetOffsetX = (w - _bitmap.Width * _targetZoom) / 2f;
+        _targetOffsetY = (h - _bitmap.Height * _targetZoom) / 2f;
+        StartZoomAnim();
+        ZoomChanged?.Invoke(_targetZoom);
+    }
+
+    public void ZoomToOriginal()
+    {
+        if (_bitmap == null) return;
+        _targetZoom = 1f;
+        CenterImage();
+        StartZoomAnim();
+        ZoomChanged?.Invoke(_targetZoom);
+    }
+
+    public void ZoomIn()
+    {
+        _targetZoom = Math.Clamp(_zoom * 1.6f, 0.05f, 20f);
+        CenterImage();
+        StartZoomAnim();
+        ZoomChanged?.Invoke(_targetZoom);
+    }
+
+    public void ZoomOut()
+    {
+        _targetZoom = Math.Clamp(_zoom * 0.5f, 0.05f, 20f);
+        CenterImage();
+        StartZoomAnim();
+        ZoomChanged?.Invoke(_targetZoom);
+    }
+
+    private void CenterImage()
+    {
+        var w = (float)Math.Max(1, ActualWidth);
+        var h = (float)Math.Max(1, ActualHeight);
+        if (_bitmap == null || w <= 1 || h <= 1) return;
+        _targetOffsetX = (w - _bitmap.Width * _targetZoom) / 2f;
+        _targetOffsetY = (h - _bitmap.Height * _targetZoom) / 2f;
+    }
+
+    private void RenderToWriteableBitmap()
+    {
+        if (_bitmap == null) return;
+
+        var w = Math.Max(1, (int)RenderSize.Width);
+        var h = Math.Max(1, (int)RenderSize.Height);
+
+        if (_wbmp == null || _wbmp.PixelWidth != w || _wbmp.PixelHeight != h)
+            _wbmp = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+
+        using var surface = SKSurface.Create(new SKImageInfo(w, h, SKColorType.Bgra8888, SKAlphaType.Premul));
+        var canvas = surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+
+        if (_animOpacity < 1f)
+        {
+            using var paint = new SKPaint { Color = new SKColor(255, 255, 255, (byte)(255 * _animOpacity)) };
+            canvas.Save();
+            canvas.Translate(_offsetX, _offsetY);
+            canvas.Scale(_zoom);
+            canvas.DrawBitmap(_bitmap, 0, 0, paint);
+            canvas.Restore();
+        }
+        else
+        {
+            canvas.Save();
+            canvas.Translate(_offsetX, _offsetY);
+            canvas.Scale(_zoom);
+            canvas.DrawBitmap(_bitmap, 0, 0);
+            canvas.Restore();
+        }
+
+        using var image = surface.Snapshot();
+        using var pixmap = image.PeekPixels();
+        if (pixmap == null) return;
+
+        var srcRect = new Int32Rect(0, 0, w, h);
+        var bytes = pixmap.GetPixelSpan();
+        _wbmp.Lock();
+        unsafe
+        {
+            fixed (byte* ptr = bytes)
+            {
+                _wbmp.WritePixels(srcRect, (IntPtr)ptr, bytes.Length, w * 4);
+            }
+        }
+        _wbmp.Unlock();
+        _dirty = false;
+    }
+
+    protected override void OnRender(DrawingContext dc)
+    {
+        if (_bitmap == null)
+        {
+            return;
+        }
+
+        if (_dirty || _wbmp == null)
+            RenderToWriteableBitmap();
+
+        if (_wbmp != null)
+            dc.DrawImage(_wbmp, new Rect(RenderSize));
+    }
+
+    protected override void OnMouseWheel(MouseWheelEventArgs e)
+    {
+        if (_bitmap == null) return;
+
+        var pos = e.GetPosition(this);
+        var factor = e.Delta > 0 ? 1.3f : 0.7f;
+        _targetZoom = Math.Clamp(_zoom * factor, 0.05f, 20f);
+
+        var worldX = (pos.X - _offsetX) / _zoom;
+        var worldY = (pos.Y - _offsetY) / _zoom;
+
+        _targetOffsetX = (float)(pos.X - worldX * _targetZoom);
+        _targetOffsetY = (float)(pos.Y - worldY * _targetZoom);
+
+        StartZoomAnim();
+        ZoomChanged?.Invoke(_targetZoom);
+        e.Handled = true;
+    }
+
+    protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
+    {
+        if (_bitmap == null) return;
+        _isDragging = true;
+        _isPanning = false;
+        _dragStart = e.GetPosition(this);
+        _dragStartOffsetX = _offsetX;
+        _dragStartOffsetY = _offsetY;
+
+        if (_animating)
+        {
+            CompositionTarget.Rendering -= OnRendering;
+            _animating = false;
+        }
+
+        CaptureMouse();
+        e.Handled = true;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        if (!_isDragging || _bitmap == null) return;
+        var pos = e.GetPosition(this);
+        _offsetX = _dragStartOffsetX + (float)(pos.X - _dragStart.X);
+        _offsetY = _dragStartOffsetY + (float)(pos.Y - _dragStart.Y);
+        _targetOffsetX = _offsetX;
+        _targetOffsetY = _offsetY;
+
+        var dx = Math.Abs(pos.X - _dragStart.X);
+        var dy = Math.Abs(pos.Y - _dragStart.Y);
+        if (dx > 2 || dy > 2) _isPanning = true;
+
+        _dirty = true;
+        InvalidateVisual();
+        e.Handled = true;
+    }
+
+    protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
+    {
+        if (!_isDragging)
+        {
+            base.OnMouseLeftButtonUp(e);
+            return;
+        }
+        _isDragging = false;
+        ReleaseMouseCapture();
+
+        if (!_isPanning && e.ClickCount == 2 && _bitmap != null)
+        {
+            if (Math.Abs(_zoom - _fitScale) < 0.01f)
+                ZoomToOriginal();
+            else
+                FitToScreen();
+        }
+
+        e.Handled = true;
+    }
+}
